@@ -2,10 +2,11 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"github.com/gorilla/handlers"
 	"github.com/gorilla/mux"
 	"github.com/gorilla/sessions"
-	"github.com/roobie/syscat/hello"
 	"github.com/roobie/syscat/security"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/github"
@@ -39,33 +40,62 @@ var conf = &oauth2.Config{
 func main() {
 	router := mux.NewRouter()
 
-	fmt.Println(hello.BuildHello())
-
 	router.HandleFunc("/", rootHandler)
+	router.HandleFunc("/error", errorHandler)
 	router.HandleFunc("/connect/github/callback", githubCallbackHandler)
-	http.Handle("/", router)
 
-	err := http.ListenAndServeTLS("syscat.lan:8443", cer, key, nil)
+	// TODO: validate MAC in state
+	router.Use(CorrelationIdMiddleWare)
+	router.Use(LoggingMiddleware)
+
+	err := http.ListenAndServeTLS("syscat.lan:8443", cer, key, handlers.CORS()(router))
 	log.Fatal(err)
 }
 
+func CorrelationIdMiddleWare(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// mac := ""
+		correlationId := ""
+		if r.URL.Path == "/connect/github/callback" {
+			state := r.URL.Query().Get("state")
+			parts := strings.Split(state, "|")
+			// mac = parts[0]
+			correlationId = parts[1]
+		} else {
+			correlationId = security.MakeUUIDOrDie()
+		}
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), correlationIdKey, correlationId)))
+	})
+}
+
+func LoggingMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		correlationId := getCorrelationId(r)
+		log.Printf("[%s] - %s\n", correlationId, r.URL)
+		next.ServeHTTP(w, r)
+	})
+}
+
+func errorHandler(w http.ResponseWriter, r *http.Request) {
+	respondWithError(ErrorContext{
+		w:          w,
+		r:          r,
+		statusCode: http.StatusInternalServerError,
+		message:    "Testing error response",
+		err:        errors.New("Error object!"),
+	})
+}
+
 func rootHandler(w http.ResponseWriter, r *http.Request) {
-	correlationId, err := security.MakeUUID()
-	if err != nil {
-		respondWithError(ErrorContext{
-			w:             w,
-			r:             r,
-			statusCode:    http.StatusInternalServerError,
-			correlationId: correlationId,
-			message:       "Could not create a UUID",
-			err:           err,
-		})
-		return
-	}
 	session, err := store.Get(r, appSessionName)
 	if err != nil {
-		log.Println("Could not retrieve session")
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		respondWithError(ErrorContext{
+			w:          w,
+			r:          r,
+			statusCode: http.StatusInternalServerError,
+			message:    "Could not retrieve session",
+			err:        err,
+		})
 		return
 	}
 
@@ -74,7 +104,7 @@ func rootHandler(w http.ResponseWriter, r *http.Request) {
 		client := conf.Client(ctx, tok)
 		response, err := client.Get("https://api.github.com/user")
 		if err != nil {
-			log.Printf("Failed to query https://api.github.com/user due to [%s]\n", err.Error())
+			log.Printf("[%s] Failed to query https://api.github.com/user due to [%s]\n", getCorrelationId(r), err.Error())
 			if strings.Contains(err.Error(), "token expired") {
 				loginAtIdP(conf, w, r)
 			} else {
@@ -139,27 +169,38 @@ func loginAtIdP(conf *oauth2.Config, w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	state := security.ConstructMAC(nonce, []byte(appSecret))
+	state := fmt.Sprintf("%s|%s", security.ConstructMAC(nonce, []byte(appSecret)), getCorrelationId(r))
 	authCodeUrl := conf.AuthCodeURL(state, oauth2.AccessTypeOffline)
 	http.Redirect(w, r, authCodeUrl, http.StatusTemporaryRedirect)
 }
 
 type ErrorContext struct {
-	w             http.ResponseWriter
-	r             *http.Request
-	statusCode    int
-	correlationId string
-	message       string
-	err           error
+	w          http.ResponseWriter
+	r          *http.Request
+	statusCode int
+	message    string
+	err        error
+}
+
+func getCorrelationId(r *http.Request) string {
+	correlationId := r.Context().Value(correlationIdKey)
+	if correlationId == nil {
+		return "00000000-0000-0000-0000-000000000000"
+	} else {
+		return correlationId.(string)
+	}
 }
 
 func respondWithError(ectx ErrorContext) {
-	msgOut := fmt.Sprintf("[%s] %d %s", ectx.correlationId, ectx.statusCode, ectx.message)
-	log.Println(msgOut)
+	correlationId := getCorrelationId(ectx.r)
 	// if isDevelopment {
 	if ectx.err != nil {
+		msgOut := fmt.Sprintf("[%s] %d %s - ERROR: %s", correlationId, ectx.statusCode, ectx.message, ectx.err.Error())
+		log.Println(msgOut)
 		http.Error(ectx.w, fmt.Sprintf("%s\n%s", msgOut, ectx.err.Error()), ectx.statusCode)
 	} else {
+		msgOut := fmt.Sprintf("[%s] %d %s", correlationId, ectx.statusCode, ectx.message)
+		log.Println(msgOut)
 		http.Error(ectx.w, msgOut, ectx.statusCode)
 	}
 	// } else {...}
