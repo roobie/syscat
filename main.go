@@ -28,6 +28,7 @@ const authKey string = "syscat-auth"
 const correlationIdKey string = "syscat-correlation-id"
 
 var store = sessions.NewCookieStore([]byte(appSecret))
+var macMap map[string][]byte = make(map[string][]byte)
 var tokenMap map[string]*oauth2.Token = make(map[string]*oauth2.Token)
 var ctx = context.Background()
 var conf = &oauth2.Config{
@@ -44,7 +45,6 @@ func main() {
 	router.HandleFunc("/error", errorHandler)
 	router.HandleFunc("/connect/github/callback", githubCallbackHandler)
 
-	// TODO: validate MAC in state
 	router.Use(CorrelationIdMiddleWare)
 	router.Use(LoggingMiddleware)
 
@@ -54,12 +54,19 @@ func main() {
 
 func CorrelationIdMiddleWare(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// mac := ""
 		correlationId := ""
 		if r.URL.Path == "/connect/github/callback" {
 			state := r.URL.Query().Get("state")
 			parts := strings.Split(state, "|")
-			// mac = parts[0]
+			if len(parts) != 2 {
+				respondWithError(ErrorContext{
+					w:          w,
+					r:          r,
+					statusCode: http.StatusInternalServerError,
+					message:    "Error",
+				})
+				return
+			}
 			correlationId = parts[1]
 		} else {
 			correlationId = security.MakeUUIDOrDie()
@@ -126,14 +133,35 @@ func rootHandler(w http.ResponseWriter, r *http.Request) {
 
 func githubCallbackHandler(w http.ResponseWriter, r *http.Request) {
 	query := r.URL.Query()
-	code, ok := query["code"]
-	if !ok || len(code[0]) < 1 {
+
+	state := query.Get("state")
+	parts := strings.Split(state, "|")
+	mac := parts[0]
+	nonce := macMap[mac]
+	if nonce == nil || security.ValidMAC(nonce, []byte(mac), []byte(appSecret)) {
+		respondWithError(ErrorContext{
+			w:          w,
+			r:          r,
+			statusCode: http.StatusInternalServerError,
+			message:    "Validation failed",
+			err:        errors.New("Validation failed"),
+		})
+	}
+
+	code := query.Get("code")
+	if len(code) < 1 {
 		http.Error(w, "Invalid response from identity provider", http.StatusInternalServerError)
 		return
 	}
-	tok, err := conf.Exchange(ctx, code[0])
+	tok, err := conf.Exchange(ctx, code)
 	if err != nil {
-		log.Fatal(err)
+		respondWithError(ErrorContext{
+			w:          w,
+			r:          r,
+			statusCode: http.StatusInternalServerError,
+			message:    "Could not exchange the authorization code for an acess token",
+			err:        err,
+		})
 	}
 
 	session, err := store.Get(r, appSessionName)
@@ -169,7 +197,9 @@ func loginAtIdP(conf *oauth2.Config, w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	state := fmt.Sprintf("%s|%s", security.ConstructMAC(nonce, []byte(appSecret)), getCorrelationId(r))
+	mac := security.ConstructMAC(nonce, []byte(appSecret))
+	state := fmt.Sprintf("%s|%s", mac, getCorrelationId(r))
+	macMap[mac] = nonce
 	authCodeUrl := conf.AuthCodeURL(state, oauth2.AccessTypeOffline)
 	http.Redirect(w, r, authCodeUrl, http.StatusTemporaryRedirect)
 }
