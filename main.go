@@ -2,13 +2,11 @@ package main
 
 import (
 	"context"
-	"crypto/hmac"
-	"crypto/rand"
-	"crypto/sha256"
-	"encoding/base64"
 	"fmt"
+	"github.com/gorilla/mux"
 	"github.com/gorilla/sessions"
 	"github.com/roobie/syscat/hello"
+	"github.com/roobie/syscat/security"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/github"
 	"io/ioutil"
@@ -30,165 +28,139 @@ const correlationIdKey string = "syscat-correlation-id"
 
 var store = sessions.NewCookieStore([]byte(appSecret))
 var tokenMap map[string]*oauth2.Token = make(map[string]*oauth2.Token)
-
-// Writes to and closes `w`, so it cannot be altered elsewhere.
-func loginAtIdP(conf *oauth2.Config, w http.ResponseWriter, r *http.Request) {
-	nonce, err := GenerateRandomBytes(64)
-	if err != nil {
-		log.Println("Could not generate HMAC")
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	state := ConstructMAC(nonce, []byte(appSecret))
-	authCodeUrl := conf.AuthCodeURL(state, oauth2.AccessTypeOffline)
-	http.Redirect(w, r, authCodeUrl, http.StatusTemporaryRedirect)
-}
-
-func RespondWithError(w http.ResponseWriter, r *http.Request, statusCode int, correlationId string, message string, err error) {
-	msgOut := fmt.Sprintf("[%s] %d %s", correlationId, statusCode, message)
-	log.Println(msgOut)
-	// if isDevelopment {
-	if err != nil {
-		http.Error(w, fmt.Sprintf("%s\n%s", msgOut, err.Error()), http.StatusInternalServerError)
-	} else {
-		http.Error(w, msgOut, http.StatusInternalServerError)
-	}
-	// } else {...}
+var ctx = context.Background()
+var conf = &oauth2.Config{
+	ClientID:     os.Getenv("SYSCAT_GH_CLIENT_ID"),
+	ClientSecret: os.Getenv("SYSCAT_GH_CLIENT_SECRET"),
+	Scopes:       []string{"openid", "profile"},
+	Endpoint:     github.Endpoint,
 }
 
 func main() {
-	ctx := context.Background()
-
-	conf := &oauth2.Config{
-		ClientID:     os.Getenv("SYSCAT_GH_CLIENT_ID"),
-		ClientSecret: os.Getenv("SYSCAT_GH_CLIENT_SECRET"),
-		Scopes:       []string{"openid", "profile"},
-		Endpoint:     github.Endpoint,
-	}
+	router := mux.NewRouter()
 
 	fmt.Println(hello.BuildHello())
 
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		correlationId, err := MakeUUID()
-		if err != nil {
-			RespondWithError(w, r, http.StatusInternalServerError, correlationId, "Could not create a UUID", err)
-			return
-		}
-		session, err := store.Get(r, appSessionName)
-		if err != nil {
-			log.Println("Could not retrieve session")
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		if session.Values[authKey] != nil {
-			tok := tokenMap[session.Values[authKey].(string)]
-			client := conf.Client(ctx, tok)
-			response, err := client.Get("https://api.github.com/user")
-			if err != nil {
-				log.Printf("Failed to query https://api.github.com/user due to [%s]\n", err.Error())
-				if strings.Contains(err.Error(), "token expired") {
-					loginAtIdP(conf, w, r)
-				} else {
-					http.Error(w, err.Error(), http.StatusInternalServerError)
-				}
-				return
-			}
-			body, err := ioutil.ReadAll(response.Body)
-			if err != nil {
-				log.Println("Failed read response from https://api.github.com/user")
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-				return
-			}
-			fmt.Fprintf(w, "Body: %s\n", string(body))
-		} else {
-			loginAtIdP(conf, w, r)
-		}
-	})
-
-	http.HandleFunc("/connect/github/callback", func(w http.ResponseWriter, r *http.Request) {
-		query := r.URL.Query()
-		code, ok := query["code"]
-		if !ok || len(code[0]) < 1 {
-			http.Error(w, "Invalid response from identity provider", http.StatusInternalServerError)
-			return
-		}
-		tok, err := conf.Exchange(ctx, code[0])
-		if err != nil {
-			log.Fatal(err)
-		}
-
-		session, err := store.Get(r, appSessionName)
-		if err != nil {
-			log.Println("Could not retrieve session")
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		randStr, err := GenerateRandomString(32)
-		if err != nil {
-			log.Println("Could not make random string")
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		tokenMap[randStr] = tok
-		session.Values[authKey] = randStr
-		err = session.Save(r, w)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		http.Redirect(w, r, "/", http.StatusTemporaryRedirect)
-	})
+	router.HandleFunc("/", rootHandler)
+	router.HandleFunc("/connect/github/callback", githubCallbackHandler)
+	http.Handle("/", router)
 
 	err := http.ListenAndServeTLS("syscat.lan:8443", cer, key, nil)
 	log.Fatal(err)
 }
 
-// GenerateRandomBytes returns securely generated random bytes.
-// It will return an error if the system's secure random
-// number generator fails to function correctly, in which
-// case the caller should not continue.
-func GenerateRandomBytes(n int) ([]byte, error) {
-	b := make([]byte, n)
-	_, err := rand.Read(b)
-	// Note that err == nil only if we read len(b) bytes.
+func rootHandler(w http.ResponseWriter, r *http.Request) {
+	correlationId, err := security.MakeUUID()
 	if err != nil {
-		return nil, err
+		respondWithError(ErrorContext{
+			w:             w,
+			r:             r,
+			statusCode:    http.StatusInternalServerError,
+			correlationId: correlationId,
+			message:       "Could not create a UUID",
+			err:           err,
+		})
+		return
+	}
+	session, err := store.Get(r, appSessionName)
+	if err != nil {
+		log.Println("Could not retrieve session")
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
 	}
 
-	return b, nil
-}
-
-// GenerateRandomString returns a URL-safe, base64 encoded
-// securely generated random string.
-func GenerateRandomString(s int) (string, error) {
-	b, err := GenerateRandomBytes(s)
-	return base64.URLEncoding.EncodeToString(b), err
-}
-
-func ConstructMAC(message, key []byte) string {
-	mac := hmac.New(sha256.New, key)
-	mac.Write(message)
-	return base64.URLEncoding.EncodeToString(mac.Sum(nil))
-}
-
-// ValidMAC reports whether messageMAC is a valid HMAC tag for message.
-func ValidMAC(message, messageMAC, key []byte) bool {
-	mac := hmac.New(sha256.New, key)
-	mac.Write(message)
-	expectedMAC := mac.Sum(nil)
-	return hmac.Equal(messageMAC, expectedMAC)
-}
-
-func MakeUUID() (string, error) {
-	b, err := GenerateRandomBytes(16)
-	if err != nil {
-		return "", err
+	if session.Values[authKey] != nil {
+		tok := tokenMap[session.Values[authKey].(string)]
+		client := conf.Client(ctx, tok)
+		response, err := client.Get("https://api.github.com/user")
+		if err != nil {
+			log.Printf("Failed to query https://api.github.com/user due to [%s]\n", err.Error())
+			if strings.Contains(err.Error(), "token expired") {
+				loginAtIdP(conf, w, r)
+			} else {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+			}
+			return
+		}
+		body, err := ioutil.ReadAll(response.Body)
+		if err != nil {
+			log.Println("Failed read response from https://api.github.com/user")
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		fmt.Fprintf(w, "Body: %s\n", string(body))
+	} else {
+		loginAtIdP(conf, w, r)
 	}
-	uuid := fmt.Sprintf("%x-%x-%x-%x-%x",
-		b[0:4], b[4:6], b[6:8], b[8:10], b[10:])
-	return uuid, nil
+}
+
+func githubCallbackHandler(w http.ResponseWriter, r *http.Request) {
+	query := r.URL.Query()
+	code, ok := query["code"]
+	if !ok || len(code[0]) < 1 {
+		http.Error(w, "Invalid response from identity provider", http.StatusInternalServerError)
+		return
+	}
+	tok, err := conf.Exchange(ctx, code[0])
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	session, err := store.Get(r, appSessionName)
+	if err != nil {
+		log.Println("Could not retrieve session")
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	randStr, err := security.GenerateRandomString(32)
+	if err != nil {
+		log.Println("Could not make random string")
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	tokenMap[randStr] = tok
+	session.Values[authKey] = randStr
+	err = session.Save(r, w)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	http.Redirect(w, r, "/", http.StatusTemporaryRedirect)
+}
+
+// Writes to and closes `w`, so it cannot be altered elsewhere.
+func loginAtIdP(conf *oauth2.Config, w http.ResponseWriter, r *http.Request) {
+	nonce, err := security.GenerateRandomBytes(64)
+	if err != nil {
+		log.Println("Could not generate HMAC")
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	state := security.ConstructMAC(nonce, []byte(appSecret))
+	authCodeUrl := conf.AuthCodeURL(state, oauth2.AccessTypeOffline)
+	http.Redirect(w, r, authCodeUrl, http.StatusTemporaryRedirect)
+}
+
+type ErrorContext struct {
+	w             http.ResponseWriter
+	r             *http.Request
+	statusCode    int
+	correlationId string
+	message       string
+	err           error
+}
+
+func respondWithError(ectx ErrorContext) {
+	msgOut := fmt.Sprintf("[%s] %d %s", ectx.correlationId, ectx.statusCode, ectx.message)
+	log.Println(msgOut)
+	// if isDevelopment {
+	if ectx.err != nil {
+		http.Error(ectx.w, fmt.Sprintf("%s\n%s", msgOut, ectx.err.Error()), ectx.statusCode)
+	} else {
+		http.Error(ectx.w, msgOut, ectx.statusCode)
+	}
+	// } else {...}
 }
