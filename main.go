@@ -150,7 +150,13 @@ func githubCallbackHandler(w http.ResponseWriter, r *http.Request) {
 
 	code := query.Get("code")
 	if len(code) < 1 {
-		http.Error(w, "Invalid response from identity provider", http.StatusInternalServerError)
+		respondWithError(ErrorContext{
+			w:          w,
+			r:          r,
+			statusCode: http.StatusInternalServerError,
+			message:    "Invalid response from identity provider",
+			err:        errors.New("Invalid response from identity provider"),
+		})
 		return
 	}
 	tok, err := conf.Exchange(ctx, code)
@@ -162,19 +168,30 @@ func githubCallbackHandler(w http.ResponseWriter, r *http.Request) {
 			message:    "Could not exchange the authorization code for an acess token",
 			err:        err,
 		})
+		return
 	}
 
 	session, err := store.Get(r, appSessionName)
 	if err != nil {
-		log.Println("Could not retrieve session")
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		respondWithError(ErrorContext{
+			w:          w,
+			r:          r,
+			statusCode: http.StatusInternalServerError,
+			message:    "Could not retrieve session",
+			err:        err,
+		})
 		return
 	}
 
 	randStr, err := security.GenerateRandomString(32)
 	if err != nil {
-		log.Println("Could not make random string")
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		respondWithError(ErrorContext{
+			w:          w,
+			r:          r,
+			statusCode: http.StatusInternalServerError,
+			message:    "Could not make random string",
+			err:        err,
+		})
 		return
 	}
 
@@ -182,7 +199,13 @@ func githubCallbackHandler(w http.ResponseWriter, r *http.Request) {
 	session.Values[authKey] = randStr
 	err = session.Save(r, w)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		respondWithError(ErrorContext{
+			w:          w,
+			r:          r,
+			statusCode: http.StatusInternalServerError,
+			message:    "Could not save session",
+			err:        err,
+		})
 		return
 	}
 
@@ -193,8 +216,13 @@ func githubCallbackHandler(w http.ResponseWriter, r *http.Request) {
 func loginAtIdP(conf *oauth2.Config, w http.ResponseWriter, r *http.Request) {
 	nonce, err := security.GenerateRandomBytes(64)
 	if err != nil {
-		log.Println("Could not generate HMAC")
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		respondWithError(ErrorContext{
+			w:          w,
+			r:          r,
+			statusCode: http.StatusInternalServerError,
+			message:    "Could not generate HMAC",
+			err:        err,
+		})
 		return
 	}
 	mac := security.ConstructMAC(nonce, []byte(appSecret))
@@ -202,14 +230,6 @@ func loginAtIdP(conf *oauth2.Config, w http.ResponseWriter, r *http.Request) {
 	macMap[mac] = nonce
 	authCodeUrl := conf.AuthCodeURL(state, oauth2.AccessTypeOffline)
 	http.Redirect(w, r, authCodeUrl, http.StatusTemporaryRedirect)
-}
-
-type ErrorContext struct {
-	w          http.ResponseWriter
-	r          *http.Request
-	statusCode int
-	message    string
-	err        error
 }
 
 func getCorrelationId(r *http.Request) string {
@@ -221,17 +241,24 @@ func getCorrelationId(r *http.Request) string {
 	}
 }
 
+type ErrorContext struct {
+	w          http.ResponseWriter
+	r          *http.Request
+	statusCode int
+	message    string
+	err        error
+}
+
 func respondWithError(ectx ErrorContext) {
 	correlationId := getCorrelationId(ectx.r)
 	// if isDevelopment {
+	msgOut := ""
 	if ectx.err != nil {
 		msgOut := fmt.Sprintf("[%s] %d %s - ERROR: %s", correlationId, ectx.statusCode, ectx.message, ectx.err.Error())
-		log.Println(msgOut)
-		http.Error(ectx.w, fmt.Sprintf("%s\n%s", msgOut, ectx.err.Error()), ectx.statusCode)
 	} else {
 		msgOut := fmt.Sprintf("[%s] %d %s", correlationId, ectx.statusCode, ectx.message)
-		log.Println(msgOut)
-		http.Error(ectx.w, msgOut, ectx.statusCode)
 	}
+	log.Println(msgOut)
+	http.Error(ectx.w, msgOut, ectx.statusCode)
 	// } else {...}
 }
