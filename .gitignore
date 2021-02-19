@@ -28,3 +28,5 @@ _testmain.go
 *.prof
 
 _env.sh
+
+lua_modules/
